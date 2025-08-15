@@ -489,22 +489,20 @@ static int idt_get_reverse_temp(struct idtp9418_device_info *di)
 	return temp;
 }
 
-/* voltage limit attrs */
-static ssize_t chip_vout_show(struct device *dev, struct device_attribute *attr,
-							  char *buf)
+static ssize_t chip_status_show(struct device *dev, struct device_attribute *attr,
+								char *buf)
 {
 	struct i2c_client *client = container_of(dev, struct i2c_client, dev);
 	struct idtp9418_device_info *di = i2c_get_clientdata(client);
-	int vout;
+	int vout, iin, temp, soc;
 
-	vout = idtp9418_get_vout(di);
+	vout = idt_get_reverse_vout(di);
+	iin = idt_get_reverse_iin(di);
+	temp = idt_get_reverse_temp(di);
+	soc = idt_get_reverse_soc(di);
 
-	idt_get_reverse_vout(di);
-	idt_get_reverse_iin(di);
-	idt_get_reverse_temp(di);
-	idt_get_reverse_soc(di);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", vout);
+	return snprintf(buf, PAGE_SIZE, "vout:%d\niin:%d\ntemp:%d\nsoc:%d\n",
+					vout, iin, temp, soc);
 }
 
 static ssize_t chip_powered_show(struct device *dev,
@@ -535,10 +533,12 @@ static ssize_t chip_power_store(struct device *dev,
 
 static DEVICE_ATTR(chip_version, S_IRUGO, chip_version_show, NULL);
 static DEVICE_ATTR(chip_powered, S_IWUSR | S_IRUGO, chip_powered_show, chip_power_store);
+static DEVICE_ATTR(chip_status, S_IRUGO, chip_status_show, NULL);
 
 static struct attribute *sysfs_attrs[] = {
 	&dev_attr_chip_version.attr,
 	&dev_attr_chip_powered.attr,
+	&dev_attr_chip_status.attr,
 	NULL,
 };
 
