@@ -1,9 +1,6 @@
 #ifndef __IDTP9148_H__
 #define __IDTP9148_H__
 
-#include <linux/types.h>
-#include <linux/device.h>
-#include <linux/workqueue.h>
 #define IDT_DRIVER_NAME "idtp9418"
 #define IDT_I2C_ADDR 0x3b
 
@@ -207,13 +204,5 @@
 #define SENDPROPP BIT(0) //  SEND RX Data
 
 #define SEND_DEVICE_AUTH BIT(2)
-
-// proprietary packet type
-typedef struct
-{
-  uint8_t header;  // The header consists of a single byte that indicates the Packet type.
-  uint8_t cmd;     // Back channel command
-  uint8_t data[4]; // Send data buffer
-} ProPkt_Type;
 
 #endif

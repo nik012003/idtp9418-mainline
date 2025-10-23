@@ -12,24 +12,12 @@
  *
  ****************************************************************/
 
-#include "linux/printk.h"
 #include <linux/module.h>
-#include <linux/alarmtimer.h>
 #include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/i2c.h>
-#include <linux/workqueue.h>
-#include <linux/sysfs.h>
 #include <linux/regmap.h>
-#include <linux/spinlock.h>
-#include <linux/of_gpio.h>
-#include <linux/of_device.h>
-#include <linux/irq.h>
-#include <linux/interrupt.h>
 #include <linux/power_supply.h>
-#include <linux/memory.h>
 #include "idtp9418.h"
 
 #define LIMIT_SOC 85
@@ -79,7 +67,7 @@ static enum power_supply_property idtp9418_props[] = {
 
 void reverse_clrInt(struct idtp9418_device_info *di);
 
-int idtp9418_read(struct idtp9418_device_info *di, uint16_t reg, uint8_t *val)
+static int idtp9418_read(struct idtp9418_device_info *di, uint16_t reg, uint8_t *val)
 {
 	unsigned int temp;
 	int rc;
@@ -100,7 +88,7 @@ int idtp9418_read(struct idtp9418_device_info *di, uint16_t reg, uint8_t *val)
 	return rc;
 }
 
-int idtp9418_write(struct idtp9418_device_info *di, uint16_t reg, uint8_t val)
+static int idtp9418_write(struct idtp9418_device_info *di, uint16_t reg, uint8_t val)
 {
 	int rc = 0;
 
@@ -115,8 +103,8 @@ int idtp9418_write(struct idtp9418_device_info *di, uint16_t reg, uint8_t val)
 	return rc;
 }
 
-int idtp9418_read_buffer(struct idtp9418_device_info *di, uint16_t reg, uint8_t *buf,
-						 uint32_t size)
+static int idtp9418_read_buffer(struct idtp9418_device_info *di, uint16_t reg, uint8_t *buf,
+								uint32_t size)
 {
 	int rc = 0;
 
@@ -133,8 +121,8 @@ int idtp9418_read_buffer(struct idtp9418_device_info *di, uint16_t reg, uint8_t 
 	return rc;
 }
 
-int idtp9418_write_buffer(struct idtp9418_device_info *di, uint16_t reg, uint8_t *buf,
-						  uint32_t size)
+static int idtp9418_write_buffer(struct idtp9418_device_info *di, uint16_t reg, uint8_t *buf,
+								 uint32_t size)
 {
 	int rc = 0;
 
@@ -163,34 +151,6 @@ static void idtp9418_set_chip_power(struct idtp9418_device_info *di,
 	gpiod_set_value(di->gpios.enable, !!enable);
 }
 
-static int idtp9418_get_vout(struct idtp9418_device_info *di)
-{
-	uint8_t vout_l, vout_h;
-	int vout = -1;
-	if (!di)
-		return 0;
-	di->bus.read(di, REG_ADC_VOUT_L, &vout_l);
-	di->bus.read(di, REG_ADC_VOUT_H, &vout_h);
-	vout = vout_l | ((vout_h & 0xf) << 8);
-	vout = vout * 10 * 21 * 1000 / 40950 + ADJUST_METE_MV; // vout = val/4095*10*2.1
-	dev_info(di->dev, "%s: vout is %d\n", __func__, vout);
-	return vout;
-}
-
-static void idtp9418_set_vout(struct idtp9418_device_info *di, int mv)
-{
-	uint16_t val;
-	uint8_t vout_l, vout_h;
-	if (!di)
-		return;
-	val = (mv - 2800) * 10 / 84;
-	vout_l = val & 0xff;
-	vout_h = val >> 8;
-	di->bus.write(di, REG_VOUT_SET, vout_l);
-	di->bus.write(di, REG_VRECT_ADJ, vout_h);
-	dev_info(di->dev, "[idtp9418]: set vout voltage: %d %d\n", mv, val);
-}
-
 static void idt_set_reverse_fod(struct idtp9418_device_info *di, int mw)
 {
 	uint8_t mw_l, mw_h;
@@ -201,31 +161,6 @@ static void idt_set_reverse_fod(struct idtp9418_device_info *di, int mw)
 	di->bus.write(di, REG_FOD_LOW, mw_l);
 	di->bus.write(di, REG_FOD_HIGH, mw_h);
 	dev_info(di->dev, "set reverse fod: %d\n", mw);
-}
-
-static int idtp9418_get_iout(struct idtp9418_device_info *di)
-{
-	uint8_t cout_l, cout_h;
-	int iout = -1;
-	if (!di)
-		return 0;
-
-	di->bus.read(di, REG_RX_LOUT_L, &cout_l);
-	di->bus.read(di, REG_RX_LOUT_H, &cout_h);
-	iout = cout_l | (cout_h << 8);
-
-	return iout;
-}
-
-static int idtp9418_get_vrect(struct idtp9418_device_info *di)
-{
-	uint8_t data_list[2];
-	int vrect;
-	di->bus.read_buf(di, REG_ADC_VRECT, data_list, 2);
-	vrect = data_list[0] | ((data_list[1] & 0xf) << 8);
-	vrect = vrect * 125 * 21 * 100 / 40950; // vrect = val/4095*12.5*2.1
-
-	return vrect;
 }
 
 /*
@@ -467,34 +402,6 @@ static int idtp9418_gpio_init(struct idtp9418_device_info *di)
 	}
 
 	return 0;
-}
-
-static bool need_irq_cleared(struct idtp9418_device_info *di)
-{
-	uint8_t int_buf[4];
-	uint32_t int_val;
-	int rc = -1;
-
-	rc = di->bus.read_buf(di, REG_SYS_INT, int_buf, 4);
-	if (rc < 0)
-	{
-		dev_err(di->dev, "%s: read int state error\n", __func__);
-		return true;
-	}
-	int_val = int_buf[0] | (int_buf[1] << 8) | (int_buf[2] << 16) |
-			  (int_buf[3] << 24);
-	if (int_val != 0)
-	{
-		dev_info(di->dev, "irq not clear right: 0x%08x\n", int_val);
-		return true;
-	}
-
-	if (!gpiod_get_value(di->gpios.idt_irq))
-	{
-		dev_info(di->dev, "irq low, need clear int: %d\n", rc);
-		return true;
-	}
-	return false;
 }
 
 static bool reverse_need_irq_cleared(struct idtp9418_device_info *di, uint32_t val)
