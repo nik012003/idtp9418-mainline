@@ -37,6 +37,9 @@ struct idtp9418_device_info
 {
 	int chip_enable;
 	char *name;
+	struct power_supply *psy;
+	int charge_limit;
+	bool is_charging;
 	struct device *dev;
 	struct idtp9418_access_func bus;
 	struct regmap *regmap;
@@ -52,6 +55,12 @@ struct idtp9418_device_info
 	struct delayed_work hall_irq_work;
 	struct delayed_work charge_monitor_work;
 	struct mutex i2c_lock;
+};
+
+static enum power_supply_property idtp9418_props[] = {
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+	POWER_SUPPLY_PROP_ONLINE,
 };
 
 void reverse_clrInt(struct idtp9418_device_info *di);
@@ -278,8 +287,6 @@ static int idt_get_reverse_soc(struct idtp9418_device_info *di)
 			return -1;
 		}
 	}
-
-	dev_info(di->dev, "[reverse] soc is %d\n", soc);
 	return soc;
 }
 
@@ -527,6 +534,7 @@ static void idtp9418_reverse_charge_enable(struct idtp9418_device_info *di)
 	if (i < 3)
 	{
 		dev_info(di->dev, "reverse charging start success\n");
+		di->is_charging = true;
 		// Start timer
 		schedule_delayed_work(&di->charge_monitor_work,
 							  msecs_to_jiffies(CHARGE_MONITOR_INTERVAL));
@@ -537,6 +545,7 @@ static void idtp9418_reverse_charge_enable(struct idtp9418_device_info *di)
 		dev_info(di->dev, "reverse charging failed start\n");
 		idtp9418_enable_boost_converter(di, false);
 		idtp9418_set_chip_power(di, false);
+		di->is_charging = false;
 		cancel_delayed_work_sync(&di->charge_monitor_work);
 	}
 }
@@ -554,8 +563,9 @@ static void idtp9418_charge_monitor_work(struct work_struct *work)
 				gpiod_get_value(di->gpios.pen_det_active_high));
 
 	dev_info(di->dev, "[charge-monitor] pen=%d soc=%d\n", attached, soc);
+	power_supply_changed(di->psy);
 
-	if (!attached || soc < 0 || soc >= LIMIT_SOC)
+	if (!attached || soc < 0 || soc >= di->charge_limit)
 	{
 		dev_info(di->dev, "[charge-monitor] stopping reverse charging. attached=%d soc=%d\n",
 				 attached, soc);
@@ -563,6 +573,8 @@ static void idtp9418_charge_monitor_work(struct work_struct *work)
 		// Turn off charging and power
 		idtp9418_enable_boost_converter(di, false);
 		idtp9418_set_chip_power(di, false);
+		di->is_charging = false;
+
 		return;
 	}
 
@@ -583,6 +595,8 @@ static void idtp9418_irq_hall_work(struct work_struct *work)
 	else
 	{
 		dev_info(di->dev, "[idtp] Pen detached! Turning off reverse charging... \n");
+		di->is_charging = false;
+		cancel_delayed_work_sync(&di->charge_monitor_work);
 	}
 
 	idtp9418_set_chip_power(di, false);
@@ -597,6 +611,7 @@ static void idtp9418_irq_hall_work(struct work_struct *work)
 		idtp9418_reverse_charge_enable(di);
 	}
 	pm_relax(di->dev);
+	power_supply_changed(di->psy);
 }
 
 static void idtp9418_irq_work(struct work_struct *work)
@@ -662,12 +677,73 @@ void reverse_clrInt(struct idtp9418_device_info *di)
 	dev_err(di->dev, "Interrupt cleared!\n");
 }
 
+static int idtp9418_get_property(struct power_supply *psy,
+								 enum power_supply_property psp,
+								 union power_supply_propval *val)
+{
+	struct idtp9418_device_info *di = power_supply_get_drvdata(psy);
+
+	switch (psp)
+	{
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = idt_get_reverse_soc(di);
+		if (val->intval < 0)
+			val->intval = 0;
+		return 0;
+
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		val->intval = di->charge_limit;
+		return 0;
+
+	case POWER_SUPPLY_PROP_ONLINE:
+		val->intval = di->is_charging ? 1 : 0;
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
+static int idtp9418_property_is_writeable(struct power_supply *psy,
+										  enum power_supply_property psp)
+{
+	switch (psp)
+	{
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int idtp9418_set_property(struct power_supply *psy,
+								 enum power_supply_property psp,
+								 const union power_supply_propval *val)
+{
+	struct idtp9418_device_info *di = power_supply_get_drvdata(psy);
+
+	switch (psp)
+	{
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		if (val->intval < 0 || val->intval > 95)
+			return -EINVAL;
+
+		di->charge_limit = val->intval;
+		dev_info(di->dev, "Charge limit set to %d%%\n", di->charge_limit);
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
 static int idtp9418_probe(struct i2c_client *client)
 {
 	int ret;
 	struct idtp9418_device_info *di;
 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
-	struct power_supply_config idtp_cfg = {};
+	struct power_supply_config idtp_cfg;
+	struct power_supply_desc *psy_desc;
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE))
 	{
@@ -686,6 +762,9 @@ static int idtp9418_probe(struct i2c_client *client)
 	di->name = IDT_DRIVER_NAME;
 	di->dev = &client->dev;
 	di->chip_enable = 0;
+
+	di->is_charging = false;
+	di->charge_limit = LIMIT_SOC;
 
 	di->regmap = devm_regmap_init_i2c(client, &i2c_idtp9418_regmap_config);
 	if (!di->regmap)
@@ -719,6 +798,29 @@ static int idtp9418_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&di->charge_monitor_work, idtp9418_charge_monitor_work);
 
 	idtp9418_set_chip_power(di, false);
+
+	// Initialize psy
+
+	psy_desc = devm_kzalloc(&client->dev, sizeof(*psy_desc), GFP_KERNEL);
+	if (!psy_desc)
+		return -ENOMEM;
+
+	psy_desc->name = "idtp9418";
+	psy_desc->type = POWER_SUPPLY_TYPE_WIRELESS;
+	psy_desc->properties = idtp9418_props;
+	psy_desc->num_properties = ARRAY_SIZE(idtp9418_props);
+	psy_desc->get_property = idtp9418_get_property;
+	psy_desc->set_property = idtp9418_set_property;
+	psy_desc->property_is_writeable = idtp9418_property_is_writeable;
+
+	idtp_cfg.drv_data = di;
+
+	di->psy = devm_power_supply_register(&client->dev, psy_desc, &idtp_cfg);
+	if (IS_ERR(di->psy))
+	{
+		dev_err(&client->dev, "Failed to register power supply\n");
+		return PTR_ERR(di->psy);
+	}
 
 	return 0;
 }
