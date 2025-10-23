@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0
+/****************************************************************
+ *
+ *     idtp9418.c - idtp9418 Wireless Power Charger Monitor driver
+ *
+ *     (c) 2021 XiaoMi, Inc.
+ *     (c) 2025 Viola Guerrera
+ *
+ *     Original author: bsp-open <bsp-open@xiaomi.com>
+ *     Adapted and cleaned up by: Viola Guerrera <viooo@anche.no>
+ *     Tested on xiaomi-nabu
+ *
+ ****************************************************************/
+
 #include "linux/printk.h"
 #include <linux/module.h>
 #include <linux/alarmtimer.h>
