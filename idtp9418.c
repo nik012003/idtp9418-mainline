@@ -8,7 +8,6 @@
 #include <linux/i2c.h>
 #include <linux/workqueue.h>
 #include <linux/sysfs.h>
-#include "idtp9418.h"
 #include <linux/regmap.h>
 #include <linux/spinlock.h>
 #include <linux/of_gpio.h>
@@ -17,23 +16,11 @@
 #include <linux/interrupt.h>
 #include <linux/power_supply.h>
 #include <linux/memory.h>
-#include <linux/pinctrl/consumer.h>
+#include "idtp9418.h"
 
 #define LIMIT_SOC 85
 
-#define MAC_LEN 6
-
 struct idtp9418_device_info;
-
-struct idtp9418_dt_props
-{
-	unsigned int irq_gpio;
-	unsigned int pen_det_active_low;
-	unsigned int pen_det_active_high;
-	unsigned int reverse_gpio;
-	unsigned int rx_ovp_ctl_gpio;
-	unsigned int reverse_boost_enable_gpio;
-};
 
 struct idtp9418_access_func
 {
@@ -52,17 +39,16 @@ struct idtp9418_device_info
 	struct device *dev;
 	struct idtp9418_access_func bus;
 	struct regmap *regmap;
-	struct idtp9418_dt_props dt_props;
-	int irq;
-	int hall3_irq;
-	int hall4_irq;
+	struct
+	{
+		struct gpio_desc *enable;
+		struct gpio_desc *boost_enable;
+		struct gpio_desc *idt_irq;
+		struct gpio_desc *pen_det_active_high;
+		struct gpio_desc *pen_det_active_low;
+	} gpios;
 	struct delayed_work irq_work;
 	struct delayed_work hall_irq_work;
-	struct delayed_work wpc_det_work;
-	struct pinctrl *idt_pinctrl;
-	struct pinctrl_state *idt_gpio_active;
-	// struct pinctrl_state *idt_gpio_suspend;
-	struct power_supply *wireless_psy;
 	struct mutex i2c_lock;
 };
 
@@ -204,39 +190,10 @@ void idtp922x_get_tx_vin(struct idtp9418_device_info *di)
 	mosfet to power the TPS22916 boost converter
 	By default, vout of the TPS22916 is the same as the input voltage
 */
-static int idtp9418_set_chip_power(struct idtp9418_device_info *di,
-								   int enable)
+static void idtp9418_set_chip_power(struct idtp9418_device_info *di,
+									int enable)
 {
-	int ret;
-
-	if (gpio_is_valid(di->dt_props.reverse_gpio))
-	{
-		ret = gpio_request(di->dt_props.reverse_gpio,
-						   "reverse-enable-gpio");
-		if (ret)
-		{
-			dev_err(di->dev,
-					"%s: unable to request reverse gpio [%d]\n",
-					__func__, di->dt_props.reverse_gpio);
-			return ret;
-		}
-
-		ret = gpio_direction_output(di->dt_props.reverse_gpio,
-									!!enable);
-		if (ret)
-		{
-			dev_err(di->dev,
-					"%s: cannot set direction for reverse enable gpio [%d]\n",
-					__func__, di->dt_props.reverse_gpio);
-		}
-
-		gpio_free(di->dt_props.reverse_gpio);
-	}
-	if (!ret)
-	{
-		di->chip_enable = enable;
-	}
-	return ret;
+	gpiod_set_value(di->gpios.enable, !!enable);
 }
 
 void idtp9418_retry_id_auth(struct idtp9418_device_info *di)
@@ -364,33 +321,9 @@ void idtp922x_request_high_addr(struct idtp9418_device_info *di)
 	Use the reverse-boost-enable-gpio gpio to turn on/off the voltage boosting.
 	This needs to be turned on after the chip is powered.
 */
-static int idtp9418_enable_boost_converter(struct idtp9418_device_info *di, int enable)
+static void idtp9418_enable_boost_converter(struct idtp9418_device_info *di, int enable)
 {
-	int ret = 0;
-
-	if (!gpio_is_valid(di->dt_props.reverse_boost_enable_gpio))
-	{
-		dev_err(di->dev, "%s: reverse_boost_enable_gpio is invalid\n", __func__);
-		return -EINVAL;
-	}
-
-	ret = gpio_request(di->dt_props.reverse_boost_enable_gpio, "reverse-boost-enable-gpio");
-	if (ret)
-	{
-		dev_err(di->dev, "%s: unable to request reverse_boost_enable_gpio [%d]\n",
-				__func__, di->dt_props.reverse_boost_enable_gpio);
-		return ret;
-	}
-
-	ret = gpio_direction_output(di->dt_props.reverse_boost_enable_gpio, !!enable);
-	if (ret)
-	{
-		dev_err(di->dev, "%s: cannot set direction for reverse_boost_enable_gpio [%d]\n",
-				__func__, di->dt_props.reverse_boost_enable_gpio);
-	}
-
-	gpio_free(di->dt_props.reverse_boost_enable_gpio);
-	return ret;
+	gpiod_set_value(di->gpios.boost_enable, !!enable);
 }
 
 static ssize_t chip_version_show(struct device *dev,
@@ -546,122 +479,85 @@ static const struct attribute_group sysfs_group_attrs = {
 	.attrs = sysfs_attrs,
 };
 
-static int idtp9418_parse_dt(struct idtp9418_device_info *di)
+static irqreturn_t idtp9418_irq_handler(int irq, void *dev_id)
 {
-	struct device_node *node = di->dev->of_node;
+	struct idtp9418_device_info *di = dev_id;
+	pm_stay_awake(di->dev);
+	schedule_delayed_work(&di->irq_work, msecs_to_jiffies(10));
+	return IRQ_HANDLED;
+}
 
-	if (!node)
-	{
-		dev_err(di->dev, "device tree node missing\n");
-		return -EINVAL;
-	}
-	struct
-	{
-		const char *name;
-		unsigned int *prop;
-	} gpio_map[] = {
-		{"idt,irq", &di->dt_props.irq_gpio},
-		{"hall,int3", &di->dt_props.pen_det_active_low},
-		{"hall,int4", &di->dt_props.pen_det_active_high},
-		{"idt,reverse-enable", &di->dt_props.reverse_gpio},
-		{"idt,reverse-booset-enable", &di->dt_props.reverse_boost_enable_gpio}};
+static irqreturn_t idtp9418_hall_irq_handler(int irq, void *dev_id)
+{
+	struct idtp9418_device_info *di = dev_id;
+	pm_stay_awake(di->dev);
+	schedule_delayed_work(&di->hall_irq_work, msecs_to_jiffies(100));
 
-	for (int i = 0; i < ARRAY_SIZE(gpio_map); i++)
-	{
-		*gpio_map[i].prop = of_get_named_gpio(node, gpio_map[i].name, 0);
-		if (!gpio_is_valid(*gpio_map[i].prop))
-		{
-			dev_err(di->dev, "dt parse error, missing %s\n", gpio_map[i].name);
-			return -ENODEV;
-		}
-	}
-
-	return 0;
+	return IRQ_HANDLED;
 }
 
 static int idtp9418_gpio_init(struct idtp9418_device_info *di)
 {
-	int ret = 0;
-	int irqn = 0;
+	struct
+	{
+		const char *name;
+		struct gpio_desc **gpio;
+		enum gpiod_flags flags;
+	} gpio_map[] = {
+		{"irq", &di->gpios.idt_irq, GPIOD_IN},
+		{"enable", &di->gpios.enable, GPIOD_OUT_HIGH},
+		{"boost-enable", &di->gpios.boost_enable, GPIOD_OUT_HIGH},
+		{"pen-det-active-high", &di->gpios.pen_det_active_high, GPIOD_IN},
+		{"pen-det-active-low", &di->gpios.pen_det_active_low, GPIOD_IN}};
 
-	di->idt_pinctrl = devm_pinctrl_get(di->dev);
-	if (IS_ERR_OR_NULL(di->idt_pinctrl))
+	for (int i = 0; i < ARRAY_SIZE(gpio_map); i++)
 	{
-		dev_err(di->dev, "No pinctrl config specified\n");
-		ret = PTR_ERR(di->dev);
-		return ret;
-	}
-	di->idt_gpio_active =
-		pinctrl_lookup_state(di->idt_pinctrl, "idt_active");
-	if (IS_ERR_OR_NULL(di->idt_gpio_active))
-	{
-		dev_err(di->dev, "No active config specified\n");
-		ret = PTR_ERR(di->idt_gpio_active);
-		return ret;
-	}
-
-	ret = pinctrl_select_state(di->idt_pinctrl, di->idt_gpio_active);
-	if (ret < 0)
-	{
-		dev_err(di->dev, "fail to select pinctrl active rc=%d\n", ret);
-		return ret;
-	}
-
-	if (gpio_is_valid(di->dt_props.irq_gpio))
-	{
-		irqn = gpio_to_irq(di->dt_props.irq_gpio);
-		if (irqn < 0)
+		*gpio_map[i].gpio = devm_gpiod_get(di->dev, gpio_map[i].name, gpio_map[i].flags);
+		if (IS_ERR(*gpio_map[i].gpio))
 		{
-			ret = irqn;
-			goto err_irq_gpio;
+			dev_err(di->dev, "Unable to get GPIO: %s\n", gpio_map[i].name);
+			return PTR_ERR(*gpio_map[i].gpio);
 		}
-		di->irq = irqn;
-	}
-	else
-	{
-		dev_err(di->dev, "%s: irq gpio not provided\n", __func__);
-		goto err_irq_gpio;
 	}
 
-	if (gpio_is_valid(di->dt_props.pen_det_active_low))
+	struct
 	{
-		irqn = gpio_to_irq(di->dt_props.pen_det_active_low);
-		if (irqn < 0)
+		const char *name;
+		struct gpio_desc *gpio;
+		irq_handler_t handler;
+		unsigned long irqflags;
+	} irq_map[] = {
 		{
-			ret = irqn;
-			goto err_irq_gpio;
-		}
-		di->hall3_irq = irqn;
-	}
-	else
-	{
-		dev_err(di->dev, "%s:hall3 irq gpio not provided\n", __func__);
-		goto err_hall3_irq_gpio;
-	}
-
-	if (gpio_is_valid(di->dt_props.pen_det_active_high))
-	{
-		irqn = gpio_to_irq(di->dt_props.pen_det_active_high);
-		if (irqn < 0)
+			"idt-irq",
+			di->gpios.idt_irq,
+			idtp9418_irq_handler,
+			IRQF_TRIGGER_FALLING,
+		},
 		{
-			ret = irqn;
-			goto err_irq_gpio;
-		}
-		di->hall4_irq = irqn;
-	}
-	else
+			"hall-pen-l-irq",
+			di->gpios.pen_det_active_low,
+			idtp9418_hall_irq_handler,
+			IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
+		},
+		{
+			"hall-pen-h-irq",
+			di->gpios.pen_det_active_high,
+			idtp9418_hall_irq_handler,
+			IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
+		}};
+	for (int i = 0; i < ARRAY_SIZE(irq_map); i++)
 	{
-		dev_err(di->dev, "%s:hall4 irq gpio not provided\n", __func__);
-		goto err_hall4_irq_gpio;
+		int ret = devm_request_irq(di->dev, gpiod_to_irq(irq_map[i].gpio),
+								   irq_map[i].handler,
+								   irq_map[i].irqflags,
+								   irq_map[i].name, di);
+		if (ret)
+		{
+			dev_err(di->dev, "failed to request gpio \"%s\" IRQ\n", irq_map[i].name);
+		}
 	}
 
-err_hall4_irq_gpio:
-	gpio_free(di->dt_props.pen_det_active_high);
-err_hall3_irq_gpio:
-	gpio_free(di->dt_props.pen_det_active_low);
-err_irq_gpio:
-	gpio_free(di->dt_props.irq_gpio);
-	return ret;
+	return 0;
 }
 
 static bool need_irq_cleared(struct idtp9418_device_info *di)
@@ -684,14 +580,7 @@ static bool need_irq_cleared(struct idtp9418_device_info *di)
 		return true;
 	}
 
-	if (gpio_is_valid(di->dt_props.irq_gpio))
-		rc = gpio_get_value(di->dt_props.irq_gpio);
-	else
-	{
-		dev_err(di->dev, "%s: irq gpio not provided\n", __func__);
-		rc = -1;
-	}
-	if (!rc)
+	if (!gpiod_get_value(di->gpios.idt_irq))
 	{
 		dev_info(di->dev, "irq low, need clear int: %d\n", rc);
 		return true;
@@ -767,17 +656,14 @@ static void idtp9418_irq_hall_work(struct work_struct *work)
 	struct idtp9418_device_info *di = container_of(work, struct idtp9418_device_info, hall_irq_work.work);
 	bool attached = false;
 
-	if (gpio_is_valid(di->dt_props.pen_det_active_low) && gpio_is_valid(di->dt_props.pen_det_active_high))
+	if (!gpiod_get_value(di->gpios.pen_det_active_low) && gpiod_get_value(di->gpios.pen_det_active_high))
 	{
-		if (!gpio_get_value(di->dt_props.pen_det_active_low) && gpio_get_value(di->dt_props.pen_det_active_high))
-		{
-			dev_info(di->dev, "[idtp] Pen attached! Turning on reverse charging... \n");
-			attached = true;
-		}
-		else
-		{
-			dev_info(di->dev, "[idtp] Pen detached! Turning off reverse charging... \n");
-		}
+		dev_info(di->dev, "[idtp] Pen attached! Turning on reverse charging... \n");
+		attached = true;
+	}
+	else
+	{
+		dev_info(di->dev, "[idtp] Pen detached! Turning off reverse charging... \n");
 	}
 
 	idtp9418_set_chip_power(di, false);
@@ -806,16 +692,7 @@ static void idtp9418_irq_work(struct work_struct *work)
 	u8 recive_data[5] = {0};
 	int irq_level;
 
-	if (gpio_is_valid(di->dt_props.irq_gpio))
-		irq_level = gpio_get_value(di->dt_props.irq_gpio);
-	else
-	{
-		dev_err(di->dev, "%s: irq gpio not provided\n", __func__);
-		irq_level = -1;
-		pm_relax(di->dev);
-		return;
-	}
-	if (irq_level)
+	if (gpiod_get_value(di->gpios.idt_irq))
 	{
 		dev_info(di->dev, "irq is high level, ignore%d\n", irq_level);
 		pm_relax(di->dev);
@@ -839,90 +716,6 @@ static void idtp9418_irq_work(struct work_struct *work)
 		msleep(5);
 	}
 	pm_relax(di->dev);
-}
-
-static irqreturn_t idtp9418_irq_handler(int irq, void *dev_id)
-{
-	struct idtp9418_device_info *di = dev_id;
-	pm_stay_awake(di->dev);
-	schedule_delayed_work(&di->irq_work, msecs_to_jiffies(10));
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t idtp9418_hall_irq_handler(int irq, void *dev_id)
-{
-	struct idtp9418_device_info *di = dev_id;
-	pm_stay_awake(di->dev);
-	schedule_delayed_work(&di->hall_irq_work, msecs_to_jiffies(100));
-
-	return IRQ_HANDLED;
-}
-
-static int idtp9418_request_and_enable_irq(struct device *dev,
-										   int irq,
-										   irq_handler_t handler,
-										   unsigned long flags,
-										   const char *name,
-										   void *dev_id)
-{
-	int ret;
-
-	if (!irq)
-	{
-		dev_err(dev, "%s: %s irq is invalid\n", __func__, name);
-		return -EINVAL;
-	}
-
-	ret = request_irq(irq, handler, flags, name, dev_id);
-	if (ret)
-	{
-		dev_err(dev, "%s: request_irq(%s) failed, ret=%d\n", __func__, name, ret);
-		return ret;
-	}
-
-	ret = enable_irq_wake(irq);
-	if (ret)
-	{
-		dev_err(dev, "%s: enable_irq_wake(%s) failed, ret=%d\n", __func__, name, ret);
-		free_irq(irq, dev_id); // cleanup on failure
-		return ret;
-	}
-
-	return 0;
-}
-
-static int idtp9418_setup_interrupts(struct idtp9418_device_info *di)
-{
-	int ret;
-
-	ret = idtp9418_request_and_enable_irq(di->dev,
-										  di->irq,
-										  idtp9418_irq_handler,
-										  IRQF_TRIGGER_FALLING,
-										  di->name,
-										  di);
-	if (ret)
-		return ret;
-
-	ret = idtp9418_request_and_enable_irq(di->dev,
-										  di->hall3_irq,
-										  idtp9418_hall_irq_handler,
-										  IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
-										  "hall3_irq",
-										  di);
-	if (ret)
-		return ret;
-
-	ret = idtp9418_request_and_enable_irq(di->dev,
-										  di->hall4_irq,
-										  idtp9418_hall_irq_handler,
-										  IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
-										  "hall4_irq",
-										  di);
-	if (ret)
-		return ret;
-
-	return 0;
 }
 
 static struct regmap_config i2c_idtp9418_regmap_config = {
@@ -960,6 +753,7 @@ void reverse_clrInt(struct idtp9418_device_info *di)
 
 static int idtp9418_probe(struct i2c_client *client)
 {
+	int ret;
 	struct idtp9418_device_info *di;
 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
 	struct power_supply_config idtp_cfg = {};
@@ -994,13 +788,6 @@ static int idtp9418_probe(struct i2c_client *client)
 	device_init_wakeup(&client->dev, true);
 	i2c_set_clientdata(client, di);
 
-	int ret = idtp9418_parse_dt(di);
-	if (ret < 0)
-	{
-		dev_err(di->dev, "%s: parse dt error [%d]\n", __func__, ret);
-		return ret;
-	}
-
 	ret = idtp9418_gpio_init(di);
 	if (ret < 0)
 	{
@@ -1019,7 +806,6 @@ static int idtp9418_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&di->irq_work, idtp9418_irq_work);
 	INIT_DELAYED_WORK(&di->hall_irq_work, idtp9418_irq_hall_work);
 
-	idtp9418_setup_interrupts(di);
 	idtp9418_set_chip_power(di, false);
 
 	return 0;
@@ -1034,14 +820,6 @@ static void idtp9418_remove(struct i2c_client *client)
 
 	cancel_delayed_work_sync(&di->irq_work);
 	cancel_delayed_work_sync(&di->hall_irq_work);
-
-	free_irq(di->hall3_irq, di);
-	free_irq(di->hall4_irq, di);
-	free_irq(di->irq, di);
-
-	gpio_free(di->dt_props.irq_gpio);
-	gpio_free(di->dt_props.pen_det_active_low);
-	gpio_free(di->dt_props.pen_det_active_high);
 }
 
 static void idtp9418_shutdown(struct i2c_client *client)
@@ -1062,13 +840,7 @@ static struct i2c_driver idtp9418_driver = {
 
 static int __init idt_init(void)
 {
-	int ret;
-
-	ret = i2c_add_driver(&idtp9418_driver);
-	if (ret)
-		printk(KERN_ERR "idt i2c driver init failed!\n");
-
-	return ret;
+	return i2c_add_driver(&idtp9418_driver);
 }
 
 static void __exit idt_exit(void)
@@ -1079,6 +851,6 @@ static void __exit idt_exit(void)
 module_init(idt_init);
 module_exit(idt_exit);
 
-MODULE_AUTHOR("bsp@xiaomi.com");
+MODULE_AUTHOR("Viola Guerrera <viooo@anche.no>");
 MODULE_DESCRIPTION("idtp9418 Wireless Power Charger Monitor driver");
 MODULE_LICENSE("GPL v2");

@@ -1,0 +1,78 @@
+// This is an example of what you should add to the dt
+
+&tlmm {
+    hall {
+        hall_intr3: hall_intr3 {
+            mux {
+                pins = "gpio101";
+                function = "gpio";
+            };
+
+            config {
+                pins = "gpio101";
+                drive-strength = <2>;
+                bias-pull-up;
+                input-enable;
+            };
+        };
+
+        hall_intr4: hall_intr4 {
+            mux {
+                pins = "gpio134";
+                function = "gpio";
+            };
+
+            config {
+                pins = "gpio134";
+                drive-strength = <2>;
+                bias-pull-up;
+                input-enable;
+            };
+        };
+    };
+
+    idt {
+        idt_int: idt_int {
+            mux {
+                pins = "gpio95";
+                function = "gpio";
+            };
+
+            config {
+                    pins = "gpio95";
+                    drive-strength = <2>;
+                    bias-pull-up;
+                    input-enable;
+            };
+        };
+
+        txon_enable: txon_enable {
+            mux {
+                pins = "gpio3";
+                function = "gpio";
+            };
+
+            config {
+                pins = "gpio3";
+                drive-strength = <16>;
+                bias-disable;
+                bias-pull-down;
+                output-low;
+            };
+        };
+    };
+};
+
+&i2c17 {
+	status = "okay";
+        idtp9418: idtp9418@3b {
+            compatible = "idt,p9418";
+            reg = <0x3b>;
+            status = "okay";
+            irq-gpios = <&tlmm 95 0x00>;
+            pen-det-active-high-gpios = <&tlmm 101 0x0>;
+            pen-det-active-low-gpios =<&tlmm 134 0x00>;
+            enable-gpios = <&tlmm 3 0x00>;
+            boost-enable-gpios = <&tlmm 47 0x00>;
+        };
+};
