@@ -686,6 +686,8 @@ static int idtp9418_get_property(struct power_supply *psy,
 	switch (psp)
 	{
 	case POWER_SUPPLY_PROP_CAPACITY:
+		if (!di->is_charging)
+			return 0;
 		val->intval = idt_get_reverse_soc(di);
 		if (val->intval < 0)
 			val->intval = 0;
