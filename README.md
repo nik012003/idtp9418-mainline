@@ -17,6 +17,9 @@ idtp9418 3-003b: [idtp] Pen detached! Turning off reverse charging...
 # TODO:
 
 - [x] Move from legacy gpio to gpiod for resource allocation
-- [ ] Set an alarm to monitor and limit charge
+- [x] Set an alarm to monitor and limit charge
+- [ ] Register a power-supply to report state of charge to userspace and change charge limit
+
+## Bonus stuff:
 - [ ] Load a default fod program if it doesn't exist
-- [ ] Register a power-supply to report state of charge to userspace
+- [ ] Get MAC address of attached pen
