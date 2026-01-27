@@ -480,7 +480,7 @@ static void idtp9418_charge_monitor_work(struct work_struct *work)
 	bool attached;
 
 	soc = idt_get_reverse_soc(di);
-	attached = (!gpiod_get_value(di->gpios.pen_det_active_low) &&
+	attached = (gpiod_get_value(di->gpios.pen_det_active_low) !=
 				gpiod_get_value(di->gpios.pen_det_active_high));
 
 	dev_info(di->dev, "[charge-monitor] pen=%d soc=%d\n", attached, soc);
@@ -508,7 +508,7 @@ static void idtp9418_irq_hall_work(struct work_struct *work)
 	struct idtp9418_device_info *di = container_of(work, struct idtp9418_device_info, hall_irq_work.work);
 	bool attached = false;
 
-	if (!gpiod_get_value(di->gpios.pen_det_active_low) && gpiod_get_value(di->gpios.pen_det_active_high))
+	if (gpiod_get_value(di->gpios.pen_det_active_low) != gpiod_get_value(di->gpios.pen_det_active_high))
 	{
 		dev_info(di->dev, "[idtp] Pen attached! Turning on reverse charging... \n");
 		attached = true;
