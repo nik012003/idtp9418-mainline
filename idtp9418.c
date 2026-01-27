@@ -665,7 +665,7 @@ static int idtp9418_probe(struct i2c_client *client)
 	int ret;
 	struct idtp9418_device_info *di;
 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
-	struct power_supply_config idtp_cfg;
+	struct power_supply_config idtp_cfg = {};
 	struct power_supply_desc *psy_desc;
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE))
